@@ -12,12 +12,16 @@ SQLite 的行级事务协调"跨实例并发未命中合并（singleflight）"�
    可在租约过期后接管回源。
 4. 慢回源跨修订不写脏数据：回源返回后再次核对"该修订仍是当前修订"，
    过期修订只标记为 stale，绝不作为有效缓存。
-5. 回源失败明确 503：失败记录带冷却期，冷却期内快速失败；旧快照
+5. 二次核验失败不等同于"修订未变"：核验时源失联时，刚拉取的节点只落为
+   stale，绝不标记 valid；本次请求与等待同次回源的请求都不得复用它，
+   只能用此前已确认（valid）的快照降级服务，没有则明确不可用。
+6. 回源失败明确 503：失败记录带冷却期，冷却期内快速失败；旧快照
    仍可通过 /snapshots 与故障响应中的 last_good 排障。
 """
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import sqlite3
@@ -82,12 +86,23 @@ def init_db() -> None:
             service    TEXT NOT NULL,
             revision   INTEGER NOT NULL,
             error      TEXT NOT NULL,
+            kind       TEXT NOT NULL DEFAULT 'fetch',  -- fetch | verify
             cooldown_until REAL NOT NULL,
             updated_at REAL NOT NULL,
             PRIMARY KEY (service, revision)
         )
         """
     )
+    # 兼容旧库：早期版本没有 kind 列，默认按回源失败处理。
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(failures)").fetchall()}
+    if "kind" not in columns:
+        try:
+            conn.execute(
+                "ALTER TABLE failures ADD COLUMN kind TEXT NOT NULL DEFAULT 'fetch'"
+            )
+        except sqlite3.OperationalError as exc:  # 两个实例同时迁移
+            if "duplicate column name" not in str(exc).lower():
+                raise
     conn.close()
 
 
@@ -98,10 +113,16 @@ class SourceUnavailable(Exception):
     pass
 
 
-async def _source_current(service: str) -> int:
+async def _source_current(service: str, verify: bool = False) -> int:
+    """查询当前修订。
+
+    verify=True 表示回源后的二次核验；配置源可对该阶段单独注入失联故障
+    （X-Cache-Phase: verify），以便模拟"拉取成功后核验时源不可达"。
+    """
+    headers = {"X-Cache-Phase": "verify"} if verify else None
     try:
         async with httpx.AsyncClient(base_url=SOURCE_BASE, timeout=HTTP_TIMEOUT) as c:
-            r = await c.get(f"/services/{service}/current")
+            r = await c.get(f"/services/{service}/current", headers=headers)
             if r.status_code == 404:
                 raise HTTPException(status_code=404, detail=f"service '{service}' not found")
             r.raise_for_status()
@@ -142,6 +163,40 @@ def _last_good(conn: sqlite3.Connection, service: str) -> dict[str, Any] | None:
         "revision": row["revision"],
         "nodes": json.loads(row["nodes"]),
         "cached_at": row["cached_at"],
+    }
+
+
+def _degraded_or_unavailable(
+    service: str,
+    reason: str,
+    kind: str,
+    last_good: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """回源结果无法确认时：仅用"此前已确认"的快照降级服务，否则明确不可用。
+
+    刚拉取但未能二次核验的节点不在此列（它只会以 stale 落库供排障）。
+    """
+    if last_good is None:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "origin unavailable and no confirmed local snapshot",
+                "service": service,
+                "reason": reason,
+                "failure_kind": kind,
+                "last_good": None,
+            },
+        )
+    return {
+        "service": service,
+        "revision": last_good["revision"],
+        "nodes": last_good["nodes"],
+        "served_by": INSTANCE_ID,
+        "from_cache": True,
+        "degraded": True,
+        "degraded_reason": reason,
+        "cached_at": last_good["cached_at"],
+        "snapshot_status": "valid",
     }
 
 
@@ -194,14 +249,35 @@ def _release_lease(conn: sqlite3.Connection, service: str, revision: int) -> Non
     )
 
 
-def _record_failure(conn: sqlite3.Connection, service: str, revision: int, error: str) -> None:
+def _record_failure(
+    conn: sqlite3.Connection,
+    service: str,
+    revision: int,
+    error: str,
+    kind: str = "fetch",
+    cooldown: float | None = None,
+) -> None:
     now = time.time()
     conn.execute(
-        "INSERT INTO failures(service, revision, error, cooldown_until, updated_at) "
-        "VALUES(?,?,?,?,?) "
+        "INSERT INTO failures(service, revision, error, kind, cooldown_until, updated_at) "
+        "VALUES(?,?,?,?,?,?) "
         "ON CONFLICT(service, revision) DO UPDATE SET error=excluded.error, "
-        "cooldown_until=excluded.cooldown_until, updated_at=excluded.updated_at",
-        (service, revision, error[:500], now + FAILURE_COOLDOWN, now),
+        "kind=excluded.kind, cooldown_until=excluded.cooldown_until, "
+        "updated_at=excluded.updated_at",
+        (
+            service,
+            revision,
+            error[:500],
+            kind,
+            now + (FAILURE_COOLDOWN if cooldown is None else cooldown),
+            now,
+        ),
+    )
+
+
+def _clear_failure(conn: sqlite3.Connection, service: str, revision: int) -> None:
+    conn.execute(
+        "DELETE FROM failures WHERE service=? AND revision=?", (service, revision)
     )
 
 
@@ -213,18 +289,87 @@ def _save_snapshot(
     source_published_at: float | None,
     still_current: bool,
 ) -> str:
-    """写入快照；仅当修订仍为当前修订时标记 valid，否则标记 stale。"""
+    """写入快照；仅当修订仍为当前修订时标记 valid，否则标记 stale。
+
+    未通过核验的写入绝不能把已确认（valid）的同修订快照降级：
+    同一修订的节点是不可变的，既有的 valid 记录保留原样。
+    """
     now = time.time()
-    status = "valid" if still_current else "stale"
+    if still_current:
+        conn.execute(
+            "INSERT INTO snapshots(service, revision, nodes, status, source_published_at, cached_at) "
+            "VALUES(?,?,?,'valid',?,?) "
+            "ON CONFLICT(service, revision) DO UPDATE SET nodes=excluded.nodes, "
+            "status='valid', source_published_at=excluded.source_published_at, "
+            "cached_at=excluded.cached_at",
+            (service, revision, json.dumps(nodes), source_published_at, now),
+        )
+        return "valid"
     conn.execute(
         "INSERT INTO snapshots(service, revision, nodes, status, source_published_at, cached_at) "
-        "VALUES(?,?,?,?,?,?) "
-        "ON CONFLICT(service, revision) DO UPDATE SET nodes=excluded.nodes, "
-        "status=excluded.status, source_published_at=excluded.source_published_at, "
-        "cached_at=excluded.cached_at",
-        (service, revision, json.dumps(nodes), status, source_published_at, now),
+        "VALUES(?,?,?,'stale',?,?) "
+        "ON CONFLICT(service, revision) DO UPDATE SET "
+        "nodes=CASE WHEN snapshots.status='valid' THEN snapshots.nodes ELSE excluded.nodes END, "
+        "source_published_at=CASE WHEN snapshots.status='valid' "
+        "THEN snapshots.source_published_at ELSE excluded.source_published_at END, "
+        "cached_at=CASE WHEN snapshots.status='valid' "
+        "THEN snapshots.cached_at ELSE excluded.cached_at END",
+        (service, revision, json.dumps(nodes), source_published_at, now),
     )
-    return status
+    row = _get_snapshot(conn, service, revision)
+    return row["status"] if row is not None else "stale"
+
+
+def _finish_failed_attempt(
+    service: str, revision: int, error: str, kind: str = "fetch"
+) -> None:
+    conn = _connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        _record_failure(conn, service, revision, error, kind=kind)
+        _release_lease(conn, service, revision)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _finish_with_snapshot(
+    service: str,
+    revision: int,
+    nodes: list[str],
+    source_published_at: float | None,
+    still_current: bool,
+    failure: tuple[str, str, float] | None = None,
+) -> str:
+    """原子提交：快照 + （可选）失败标记 + 释放租约。
+
+    快照与租约在同一事务里落库，等待者不会看到"无租约又无结论"的中间态。
+    failure = (reason, kind, cooldown_seconds)。
+    """
+    conn = _connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        status = _save_snapshot(
+            conn, service, revision, nodes, source_published_at, still_current
+        )
+        if failure is None:
+            _clear_failure(conn, service, revision)
+        else:
+            reason, kind, cooldown = failure
+            _record_failure(conn, service, revision, reason, kind=kind, cooldown=cooldown)
+        _release_lease(conn, service, revision)
+        conn.commit()
+        return status
+    finally:
+        conn.close()
+
+
+def _read_last_good(service: str) -> dict[str, Any] | None:
+    conn = _connect()
+    try:
+        return _last_good(conn, service)
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -232,33 +377,14 @@ def _save_snapshot(
 # ---------------------------------------------------------------------------
 async def _query(service: str) -> dict[str, Any]:
     # 第一步：确认当前修订。配置源整体不可达时降级：
-    # 有本地有效快照则降级服务（标记 degraded），无快照才明确 503。
+    # 仅用此前已确认的快照降级服务（标记 degraded），没有则明确 503。
     try:
         current = await _source_current(service)
-    except SourceUnavailable:
-        conn = _connect()
-        try:
-            good = _last_good(conn, service)
-            if good is None:
-                raise HTTPException(
-                    status_code=503,
-                    detail={
-                        "error": "origin unavailable and no local snapshot",
-                        "service": service,
-                        "last_good": None,
-                    },
-                )
-            return {
-                "service": service,
-                "revision": good["revision"],
-                "nodes": good["nodes"],
-                "served_by": INSTANCE_ID,
-                "from_cache": True,
-                "degraded": True,
-                "cached_at": good["cached_at"],
-            }
-        finally:
-            conn.close()
+    except SourceUnavailable as exc:
+        good = _read_last_good(service)
+        return _degraded_or_unavailable(
+            service, str(exc), "current", good
+        )
 
     conn = _connect()
     try:
@@ -283,7 +409,14 @@ async def _query(service: str) -> dict[str, Any]:
             (service, current),
         ).fetchone()
         lease_alive = inflight_row is not None and inflight_row["lease_expires_at"] > time.time()
-        if fail is not None and fail["cooldown_until"] > time.time() and not lease_alive:
+        # 核验失败（kind=verify）不进入冷却快失败：它不该阻碍配置源恢复后的
+        # 重新回源；新请求直接去抢租约重新拉取。
+        if (
+            fail is not None
+            and fail["kind"] != "verify"
+            and fail["cooldown_until"] > time.time()
+            and not lease_alive
+        ):
             raise HTTPException(
                 status_code=503,
                 detail={
@@ -297,125 +430,125 @@ async def _query(service: str) -> dict[str, Any]:
         is_leader = _try_acquire_lease(conn, service, current)
 
         if is_leader:
-            return await _run_as_leader(conn, service, current)
+            return await _run_as_leader(service, current)
         return await _wait_as_follower(conn, service, current)
     finally:
         conn.close()
 
 
-async def _run_as_leader(conn: sqlite3.Connection, service: str, revision: int) -> dict[str, Any]:
+async def _run_as_leader(service: str, revision: int) -> dict[str, Any]:
+    # 心跳覆盖"回源 + 二次核验 + 提交"全过程：核验期间租约同样不得过期。
     heartbeat_task = asyncio.create_task(_heartbeat(service, revision))
     try:
-        # 硬时限：回源不能无限占用回源资格；超时后停心跳、放租约，
-        # 其他实例可在租约过期后接管（即使本进程仍然存活）。
-        payload = await asyncio.wait_for(
-            _source_fetch(service, revision), timeout=HTTP_TIMEOUT
-        )
-    except asyncio.TimeoutError:
-        heartbeat_task.cancel()
-        conn2 = _connect()
         try:
-            conn2.execute("BEGIN IMMEDIATE")
-            _record_failure(conn2, service, revision, f"origin fetch timeout after {HTTP_TIMEOUT}s")
-            _release_lease(conn2, service, revision)
-            conn2.commit()
-        finally:
-            conn2.close()
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "error": "origin unavailable",
-                "reason": f"origin fetch timeout after {HTTP_TIMEOUT}s",
-                "service": service,
-                "requested_revision": revision,
-                "last_good": _last_good(conn, service),
-            },
-        )
-    except SourceUnavailable as exc:
-        heartbeat_task.cancel()
-        conn2 = _connect()
-        try:
-            conn2.execute("BEGIN IMMEDIATE")
-            _record_failure(conn2, service, revision, str(exc))
-            _release_lease(conn2, service, revision)
-            conn2.commit()
-        finally:
-            conn2.close()
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "error": "origin unavailable",
-                "reason": str(exc),
-                "service": service,
-                "requested_revision": revision,
-                "last_good": _last_good(conn, service),
-            },
-        )
-    except Exception as exc:
-        heartbeat_task.cancel()
-        conn2 = _connect()
-        try:
-            conn2.execute("BEGIN IMMEDIATE")
-            _record_failure(conn2, service, revision, f"unexpected: {exc!r}")
-            _release_lease(conn2, service, revision)
-            conn2.commit()
-        finally:
-            conn2.close()
-        raise HTTPException(
-            status_code=503,
-            detail={"error": "origin unavailable", "reason": repr(exc),
-                    "last_good": _last_good(conn, service)},
-        )
-    else:
-        heartbeat_task.cancel()
+            # 硬时限：回源不能无限占用回源资格；超时后停心跳、放租约，
+            # 其他实例可在租约过期后接管（即使本进程仍然存活）。
+            payload = await asyncio.wait_for(
+                _source_fetch(service, revision), timeout=HTTP_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            reason = f"origin fetch timeout after {HTTP_TIMEOUT}s"
+            _finish_failed_attempt(service, revision, reason, "fetch")
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": "origin unavailable",
+                    "reason": reason,
+                    "service": service,
+                    "requested_revision": revision,
+                    "last_good": _read_last_good(service),
+                },
+            )
+        except SourceUnavailable as exc:
+            _finish_failed_attempt(service, revision, str(exc), "fetch")
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": "origin unavailable",
+                    "reason": str(exc),
+                    "service": service,
+                    "requested_revision": revision,
+                    "last_good": _read_last_good(service),
+                },
+            )
+        except Exception as exc:
+            _finish_failed_attempt(service, revision, f"unexpected: {exc!r}", "fetch")
+            raise HTTPException(
+                status_code=503,
+                detail={"error": "origin unavailable", "reason": repr(exc),
+                        "service": service, "requested_revision": revision,
+                        "last_good": _read_last_good(service)},
+            )
 
-    # 回源成功：核对该修订是否仍是当前修订，防止慢回源把旧响应写成有效缓存
-    try:
-        latest = await _source_current(service)
-    except SourceUnavailable:
-        latest = revision  # 当前修订查询可靠；极端情况下不降级，按当前值处理
-    still_current = latest == revision
+        # 回源成功：二次核对"该修订仍是当前修订"，防止慢回源把旧响应写成有效缓存。
+        # 核验本身失败（源失联）绝不能等价于"修订未变"：未核验的结果不可确认，
+        # 只能落为 stale，请求退回到此前已确认的快照（降级）或明确不可用。
+        latest: int | None = None
+        verify_error: str | None = None
+        try:
+            latest = await asyncio.wait_for(
+                _source_current(service, verify=True), timeout=HTTP_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            verify_error = (
+                f"post-fetch revision verification timed out after {HTTP_TIMEOUT}s"
+            )
+        except SourceUnavailable as exc:
+            verify_error = f"post-fetch revision verification failed: {exc}"
+        except HTTPException as exc:
+            # 源端已不认识该服务/修订：同样无法确认本次结果
+            verify_error = f"post-fetch revision verification failed: {exc.detail}"
 
-    conn3 = _connect()
-    try:
-        conn3.execute("BEGIN IMMEDIATE")
-        status = _save_snapshot(
-            conn3,
+        if verify_error is not None:
+            # 刚拉取的节点只落 stale 供排障，绝不作为现役。
+            # failure kind=verify 让同次回源的等待者立刻拿到"未确认"结论；
+            # 它不参与任何冷却快失败，新查询会立即抢占租约重新回源，
+            # 因此不会拖住配置源恢复后的重新回源。
+            _finish_with_snapshot(
+                service,
+                revision,
+                payload["nodes"],
+                payload.get("published_at"),
+                still_current=False,
+                failure=(verify_error, "verify", 0.0),
+            )
+            return _degraded_or_unavailable(
+                service, verify_error, "verify", _read_last_good(service)
+            )
+
+        still_current = latest == revision
+        status = _finish_with_snapshot(
             service,
             revision,
             payload["nodes"],
             payload.get("published_at"),
             still_current,
         )
-        # 成功后清除失败记录与租约
-        conn3.execute(
-            "DELETE FROM failures WHERE service=? AND revision=?", (service, revision)
-        )
-        _release_lease(conn3, service, revision)
-        conn3.commit()
+
+        if not still_current:
+            # 旧修订已过期：不把它当有效结果返回，让请求走新修订
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "revision advanced during slow origin fetch; retry for latest",
+                    "fetched_revision": revision,
+                    "current_revision": latest,
+                },
+            )
+
+        return {
+            "service": service,
+            "revision": revision,
+            "nodes": payload["nodes"],
+            "served_by": INSTANCE_ID,
+            "from_cache": False,
+            "cached_at": time.time(),
+            "snapshot_status": status,
+        }
     finally:
-        conn3.close()
-
-    if not still_current:
-        # 旧修订已过期：不把它当有效结果返回，让请求走新修订
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "error": "revision advanced during slow origin fetch; retry for latest",
-                "fetched_revision": revision,
-                "current_revision": latest,
-            },
-        )
-
-    return {
-        "service": service,
-        "revision": revision,
-        "nodes": payload["nodes"],
-        "served_by": INSTANCE_ID,
-        "from_cache": False,
-        "cached_at": time.time(),
-        "snapshot_status": status,
-    }
+        heartbeat_task.cancel()
+        with contextlib.suppress(BaseException):
+            await heartbeat_task
 
 
 async def _heartbeat(service: str, revision: int) -> None:
@@ -452,7 +585,7 @@ async def _wait_as_follower(
                 "cached_at": snap["cached_at"],
             }
 
-        # leader 失败：共享失败记录生效，冷却期内明确 503。
+        # leader 失败：共享失败记录生效。
         # 但若仍有 leader 持有有效租约（例如其回源挂起、只是客户端先超时），
         # 不能直接失败，应等待租约过期后接管。
         fail = conn.execute(
@@ -465,6 +598,13 @@ async def _wait_as_follower(
         lease_alive = inflight_row is not None and inflight_row["lease_expires_at"] > time.time()
         if fail is not None and not lease_alive:
             now = time.time()
+            if fail["kind"] == "verify":
+                # 同一次回源的二次核验未过：等待者不得复用 leader 拉取的节点，
+                # 只能用此前已确认的快照降级，没有则明确不可用。
+                # 该结论不进入冷却（见 _query），不会阻碍恢复后的新回源。
+                return _degraded_or_unavailable(
+                    service, fail["error"], "verify", _last_good(conn, service)
+                )
             if fail["cooldown_until"] > now:
                 raise HTTPException(
                     status_code=503,
@@ -476,19 +616,17 @@ async def _wait_as_follower(
                     },
                 )
             # 冷却已过：清掉旧失败记录，尝试接管重新回源
-            conn.execute(
-                "DELETE FROM failures WHERE service=? AND revision=?", (service, revision)
-            )
+            _clear_failure(conn, service, revision)
             if _try_acquire_lease(conn, service, revision):
-                return await _run_as_leader(conn, service, revision)
+                return await _run_as_leader(service, revision)
 
         # 租约过期（leader 超时/退出）：接管
         if inflight_row is None:
             if _try_acquire_lease(conn, service, revision):
-                return await _run_as_leader(conn, service, revision)
+                return await _run_as_leader(service, revision)
         elif inflight_row["lease_expires_at"] <= time.time():
             if _try_acquire_lease(conn, service, revision):
-                return await _run_as_leader(conn, service, revision)
+                return await _run_as_leader(service, revision)
 
     raise HTTPException(
         status_code=503,
@@ -523,6 +661,7 @@ class QueryResult(BaseModel):
     from_cache: bool
     coalesced: bool | None = None
     degraded: bool | None = None
+    degraded_reason: str | None = None
     cached_at: float | None = None
     snapshot_status: str | None = None
 

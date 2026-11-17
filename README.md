@@ -9,8 +9,10 @@
                          ┌─────────────────────────────┐
   publish / fault  ───►  │ config-source (FastAPI)     │  SQLite: releases / current_rev
   /docs 可操作           │ :8080  修订按服务单调递增     │  故障注入: ok/delay/error/hang
+                         │                             │  + current_mode（核验失联）
                          └──────────────┬──────────────┘
-                                        │ HTTP（current 轻量查询始终可靠；全量拉取可被故障注入）
+                                        │ HTTP（current 轻量查询默认可靠；全量拉取可被故障注入，
+                                        │       也可单独注入二次核验失联）
                      ┌──────────────────┴──────────────────┐
                      ▼                                      ▼
           ┌────────────────────┐                ┌────────────────────┐
@@ -18,11 +20,12 @@
           │ app/cache.py       │   共享 SQLite   │ app/cache.py       │
           └─────────┬──────────┘  (WAL, 卷挂载)  └─────────┬──────────┘
                     └──────────────► cache.db ◄────────────┘
-                  表: snapshots(valid/stale) / inflight(租约) / failures(冷却)
+                  表: snapshots(valid/stale) / inflight(租约) / failures(kind: fetch|verify)
 ```
 
 - **配置源** (`app/source.py`)：`POST /admin/publish` 每发一次，该服务 `revision + 1`；
-  `GET /services/{s}/current` 返回当前修订（轻量、不受故障注入影响）；
+  `GET /services/{s}/current` 返回当前修订（轻量、默认不受全量拉取故障注入影响；
+  可单独注入 `current_mode` 用于模拟缓存二次核验失联）；
   `GET /services/{s}/revisions/{r}` 返回指定修订全量节点（慢/错/挂起只作用在这里）。
 - **缓存实例** (`app/cache.py`)：两个实例共享一个 SQLite 文件，无独立缓存进程，
   协调状态全部落在共享库的三张表里。
@@ -46,7 +49,17 @@
    回源返回后再次核对当前修订：若已推进，旧修订快照只写为 `status=stale`，
    本次请求返回 409 提示重试；后续查询走新修订。stale 快照保留供排障。
 
-5. **回源失败明确不可用，旧快照可排障**
+5. **二次核验失联不确认现役节点，等待者也不复用**
+   回源成功后的二次核验若与源失联（超时/5xx 等），**绝不把"核验失败"当成
+   "修订未变"**：刚拉取的节点只写为 `status=stale`（供排障），不标记 `valid`；
+   发起回源的请求与等待同一次回源的请求都只用**此前已确认**的 `valid` 快照降级
+   返回（`degraded=true` + `degraded_reason`），没有已确认快照则明确
+   `503`（`failure_kind=verify`、`last_good=null`）。
+   核验失败记录 `kind=verify`，不进入快速失败冷却，配置源恢复后新回源立即可发；
+   恢复后两实例都取回当前修订，原 stale 快照转为 `valid`。
+   同一修订的既有 `valid` 快照不会被后来的未核验写入降级。
+
+6. **回源失败明确不可用，旧快照可排障**
    回源失败统一 `503`，body 含 `reason` 与 `last_good`（最近一次有效快照）；
    失败有 3s 冷却（共享，两个实例都快速失败，避免雪崩），冷却过后自动重试。
    `GET /snapshots/{service}` 与 `/snapshots/{service}/revisions/{r}` 在源故障期间仍可读。
@@ -80,14 +93,21 @@ bash scripts/run_local.sh
 2. cache `/docs` → `GET /routes/payments` 查询，观察 `revision / nodes / from_cache / served_by`
 3. source → `POST /admin/fault` 设 `{"mode":"delay","delay":2}` 模拟慢响应；
    `error` 模拟 5xx；`hang` 模拟挂起；`ok` 恢复
-4. cache → `GET /debug/state` 看 inflight 租约、failures 冷却、snapshots 状态
-5. cache → `GET /snapshots/payments` 看全部历史快照（含 stale）
+4. 模拟二次核验失联（事故复现）：发布新修订后，在 source
+   `POST /admin/fault` 设 `{"current_mode":"error","current_code":503,"current_scope":"verify"}`，
+   再查询 cache —— 有已确认快照时返回该旧修订且 `degraded=true`（新修订快照为
+   `stale`），没有已确认快照时 `503` 且 `failure_kind=verify`；
+   改回 `{"current_mode":"ok"}` 后两台实例立即取得新修订。
+   `current_scope=all` 可模拟配置源整体不可达。
+5. cache → `GET /debug/state` 看 inflight 租约、failures 冷却（含 `kind`）、snapshots 状态
+6. cache → `GET /snapshots/payments` 看全部历史快照（含 stale）
 
 ## 自测
 
 ```bash
-.venv/bin/python -I tests/test_integration.py   # 13 项：修订一致性/并发合并/接管/跨修订/故障
-.venv/bin/python -I tests/test_edge.py          # 边界：源宕机降级、404、发布交错单调性
+.venv/bin/python -I tests/test_integration.py    # 13 项：修订一致性/并发合并/接管/跨修订/故障
+.venv/bin/python -I tests/test_verify_failure.py # 15 项：二次核验失联、等待者不复用、恢复、排障
+.venv/bin/python -I tests/test_edge.py           # 边界：源宕机降级、404、发布交错单调性
 ```
 
 ## 环境变量（cache）
@@ -100,4 +120,5 @@ bash scripts/run_local.sh
 | `FETCH_TIMEOUT` | `6` | 回源硬超时秒数 |
 | `LEASE_TTL` | `2` | 租约有效期秒数 |
 | `HEARTBEAT_INTERVAL` | `0.7` | 续租间隔秒数 |
-| `FAILURE_COOLDOWN` | `3` | 失败冷却秒数 |
+| `FAILURE_COOLDOWN` | `3` | 回源失败冷却秒数（二次核验失联不进入该冷却） |
+| `POLL_INTERVAL` | `0.15` | follower 轮询共享库间隔秒数 |

@@ -15,14 +15,26 @@ import time
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
 DB_PATH = os.environ.get("SOURCE_DB", "/data/source.db")
 
 # 故障注入状态（进程内即可，编排中只有一个配置源实例）
+# mode/delay/code 作用于全量配置拉取；current_* 作用于"当前修订"查询，
+# 用于模拟缓存二次核验时与配置源失联。
 _fault_lock = asyncio.Lock()
-_fault: dict[str, Any] = {"mode": "ok", "delay": 0.0, "code": 500}
+_fault: dict[str, Any] = {
+    "mode": "ok",
+    "delay": 0.0,
+    "code": 500,
+    "current_mode": "ok",
+    "current_delay": 0.0,
+    "current_code": 503,
+    "current_scope": "all",  # all | verify（只影响带 X-Cache-Phase: verify 的请求）
+}
+VERIFY_HEADER = "x-cache-phase"
+VERIFY_HEADER_VALUE = "verify"
 
 # 运行期统计，便于测试断言"并发合并后实际回源次数"
 _metrics: dict[str, Any] = {
@@ -86,10 +98,26 @@ class PublishRequest(BaseModel):
 class FaultRequest(BaseModel):
     mode: str = Field(
         "ok",
-        description="ok=正常；delay=延迟 delay 秒后正常返回；error=返回 HTTP 错误；hang=挂起直到超时",
+        description="全量拉取：ok=正常；delay=延迟 delay 秒后正常返回；error=返回 HTTP 错误；hang=挂起直到超时",
     )
     delay: float = Field(0.0, ge=0.0, description="delay 模式下的延迟秒数")
     code: int = Field(500, ge=400, le=599, description="error 模式下返回的状态码")
+    current_mode: str = Field(
+        "ok",
+        description=(
+            "当前修订查询：ok=正常；error=返回错误（模拟缓存二次核验失联）；"
+            "delay=延迟后返回；hang=挂起"
+        ),
+    )
+    current_delay: float = Field(0.0, ge=0.0, description="current delay 模式下的延迟秒数")
+    current_code: int = Field(503, ge=400, le=599, description="current error 模式的状态码")
+    current_scope: str = Field(
+        "all",
+        description=(
+            "all=影响所有 current 查询（源整体失联）；"
+            "verify=只影响缓存带 X-Cache-Phase: verify 的二次核验请求"
+        ),
+    )
 
 
 @app.post("/admin/publish", summary="发布一次路由配置（修订 +1）")
@@ -127,7 +155,26 @@ async def publish(req: PublishRequest) -> dict[str, Any]:
 
 
 @app.get("/services/{service}/current", summary="查询当前修订（轻量、始终可靠）")
-async def current_revision(service: str) -> dict[str, Any]:
+async def current_revision(service: str, request: Request) -> dict[str, Any]:
+    # 二次核验故障注入：默认只作用于缓存带 X-Cache-Phase: verify 的请求；
+    # current_scope=all 时模拟配置源整体不可达。
+    async with _fault_lock:
+        cmode = _fault["current_mode"]
+        cdelay = float(_fault["current_delay"])
+        ccode = int(_fault["current_code"])
+        cscope = _fault["current_scope"]
+    is_verify = request.headers.get(VERIFY_HEADER) == VERIFY_HEADER_VALUE
+    injected = cmode != "ok" and (cscope == "all" or is_verify)
+    if injected:
+        async with _metrics_lock:
+            _metrics["fault_injected_total"] += 1
+        if cmode == "delay" and cdelay > 0:
+            await asyncio.sleep(cdelay)
+        elif cmode == "hang":
+            await asyncio.Event().wait()
+        elif cmode == "error":
+            raise HTTPException(status_code=ccode, detail=f"injected current error {ccode}")
+
     conn = _connect()
     try:
         row = conn.execute(
@@ -200,8 +247,22 @@ async def get_fault() -> dict[str, Any]:
 async def set_fault(req: FaultRequest) -> dict[str, Any]:
     if req.mode not in {"ok", "delay", "error", "hang"}:
         raise HTTPException(status_code=400, detail="mode must be ok/delay/error/hang")
+    if req.current_mode not in {"ok", "delay", "error", "hang"}:
+        raise HTTPException(
+            status_code=400, detail="current_mode must be ok/delay/error/hang"
+        )
+    if req.current_scope not in {"all", "verify"}:
+        raise HTTPException(status_code=400, detail="current_scope must be all/verify")
     async with _fault_lock:
-        _fault.update(mode=req.mode, delay=req.delay, code=req.code)
+        _fault.update(
+            mode=req.mode,
+            delay=req.delay,
+            code=req.code,
+            current_mode=req.current_mode,
+            current_delay=req.current_delay,
+            current_code=req.current_code,
+            current_scope=req.current_scope,
+        )
         return dict(_fault)
 
 
